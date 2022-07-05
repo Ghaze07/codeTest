@@ -18,7 +18,7 @@ class BookingController extends Controller
     /**
      * @var BookingRepository
      */
-    protected $repository;
+    protected $bookingRepository;
 
     /**
      * BookingController constructor.
@@ -26,7 +26,7 @@ class BookingController extends Controller
      */
     public function __construct(BookingRepository $bookingRepository)
     {
-        $this->repository = $bookingRepository;
+        $this->bookingRepository = $bookingRepository;
     }
 
     /**
@@ -35,17 +35,16 @@ class BookingController extends Controller
      */
     public function index(Request $request)
     {
-        if($user_id = $request->get('user_id')) {
+        /*
+         * env('ADMIN_ROLE_ID') should be User::ADMIN_ROLE_ID
+         * It would be better if Role Ids be defined as a constants on User Model instead of in env, as these are context of Model not an environment variables 
+        */
 
-            $response = $this->repository->getUsersJobs($user_id);
-
+        if (in_array($request->authenticatedUser->user_type, [env('ADMIN_ROLE_ID'), env('SUPERADMIN_ROLE_ID')])) {
+            return response($this->bookingRepository->getAllJobs($request));
         }
-        elseif($request->__authenticatedUser->user_type == env('ADMIN_ROLE_ID') || $request->__authenticatedUser->user_type == env('SUPERADMIN_ROLE_ID'))
-        {
-            $response = $this->repository->getAll($request);
-        }
 
-        return response($response);
+        return response($this->bookingRepository->getUsersJobs($request->user_id));
     }
 
     /**

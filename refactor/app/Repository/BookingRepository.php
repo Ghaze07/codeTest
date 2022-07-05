@@ -57,32 +57,47 @@ class BookingRepository extends BaseRepository
      */
     public function getUsersJobs($user_id)
     {
-        $cuser = User::find($user_id);
-        $usertype = '';
-        $emergencyJobs = array();
-        $noramlJobs = array();
-        if ($cuser && $cuser->is('customer')) {
-            $jobs = $cuser->jobs()->with('user.userMeta', 'user.average', 'translatorJobRel.user.average', 'language', 'feedback')->whereIn('status', ['pending', 'assigned', 'started'])->orderBy('due', 'asc')->get();
-            $usertype = 'customer';
-        } elseif ($cuser && $cuser->is('translator')) {
-            $jobs = Job::getTranslatorJobs($cuser->id, 'new');
-            $jobs = $jobs->pluck('jobs')->all();
-            $usertype = 'translator';
-        }
-        if ($jobs) {
-            foreach ($jobs as $jobitem) {
-                if ($jobitem->immediate == 'yes') {
-                    $emergencyJobs[] = $jobitem;
-                } else {
-                    $noramlJobs[] = $jobitem;
-                }
-            }
-            $noramlJobs = collect($noramlJobs)->each(function ($item, $key) use ($user_id) {
-                $item['usercheck'] = Job::checkParticularJob($user_id, $item);
-            })->sortBy('due')->all();
+        $user = User::find($user_id);
+
+        if (!$user) {
+            return ['error' => 'User not found'];
         }
 
-        return ['emergencyJobs' => $emergencyJobs, 'noramlJobs' => $noramlJobs, 'cuser' => $cuser, 'usertype' => $usertype];
+        $userType = '';
+        $emergencyJobs = collect();
+        $noramlJobs = collect();
+
+        //this could be defined in the model as isCustomer() and isTranslator()
+        if ($user->is('customer')) {
+            $jobs = $user->jobs()->with('user.userMeta', 'user.average', 'translatorJobRel.user.average', 'language', 'feedback')->whereIn('status', ['pending', 'assigned', 'started'])->orderBy('due', 'asc')->get();
+            $userType = 'customer';
+        } elseif ($user->is('translator')) {
+            $jobs = Job::getTranslatorJobs($user->id, 'new');
+            $jobs = $jobs->pluck('jobs')->all(); //could not understand the context of this line
+            $userType = 'translator';
+        }
+        
+        if ($jobs) {
+            $jobs->each(function ($job, $key) use($emergencyJobs, $noramlJobs) {
+                if ($job->immediate == 'yes') {
+                    return $emergencyJobs->push($job);
+                }
+
+                return $noramlJobs->push($job);
+
+            });
+
+            $noramlJobs = $noramlJobs->each(function($job, $key) use ($user_id) {
+                $job->usercheck = Job::checkParticularJob($user_id, $job);
+            });
+        }
+
+        return [
+            'emergencyJobs' => $emergencyJobs, 
+            'noramlJobs' => $noramlJobs, 
+            'user' => $user, 
+            'userType' => $userType
+        ];
     }
 
     /**
@@ -1680,199 +1695,176 @@ class BookingRepository extends BaseRepository
         return $response;
     }
 
-    public function getAll(Request $request, $limit = null)
+    public function getAllJobs($request, $limit = null)
     {
-        $requestdata = $request->all();
-        $cuser = $request->__authenticatedUser;
-        $consumer_type = $cuser->consumer_type;
+        $customer = $request->authenticatedUser;
+        $consumer_type = $customer->consumer_type;
 
-        if ($cuser && $cuser->user_type == env('SUPERADMIN_ROLE_ID')) {
-            $allJobs = Job::query();
+        $jobs = Job::query();
 
-            if (isset($requestdata['feedback']) && $requestdata['feedback'] != 'false') {
-                $allJobs->where('ignore_feedback', '0');
-                $allJobs->whereHas('feedback', function ($q) {
-                    $q->where('rating', '<=', '3');
+        /*
+         * env('SUPERADMIN_ROLE_ID') should be User::SUPERADMIN_ROLE_ID
+         * It would be better if Role Ids be defined as a constants on User Model instead of in env, as these are context of Model not an environment variables 
+        */
+
+        if ($customer && $customer->user_type == env('SUPERADMIN_ROLE_ID')) {
+
+            if ($request->filled('feedback') && $request->feedback != false) {
+
+                $jobs->where('ignore_feedback', false);
+                $jobs->whereHas('feedback', function ($query) {
+                    return $query->where('rating', '<=', 3);
                 });
-                if (isset($requestdata['count']) && $requestdata['count'] != 'false') return ['count' => $allJobs->count()];
-            }
 
-            if (isset($requestdata['id']) && $requestdata['id'] != '') {
-                if (is_array($requestdata['id']))
-                    $allJobs->whereIn('id', $requestdata['id']);
-                else
-                    $allJobs->where('id', $requestdata['id']);
-                $requestdata = array_only($requestdata, ['id']);
-            }
-
-            if (isset($requestdata['lang']) && $requestdata['lang'] != '') {
-                $allJobs->whereIn('from_language_id', $requestdata['lang']);
-            }
-            if (isset($requestdata['status']) && $requestdata['status'] != '') {
-                $allJobs->whereIn('status', $requestdata['status']);
-            }
-            if (isset($requestdata['expired_at']) && $requestdata['expired_at'] != '') {
-                $allJobs->where('expired_at', '>=', $requestdata['expired_at']);
-            }
-            if (isset($requestdata['will_expire_at']) && $requestdata['will_expire_at'] != '') {
-                $allJobs->where('will_expire_at', '>=', $requestdata['will_expire_at']);
-            }
-            if (isset($requestdata['customer_email']) && count($requestdata['customer_email']) && $requestdata['customer_email'] != '') {
-                $users = DB::table('users')->whereIn('email', $requestdata['customer_email'])->get();
-                if ($users) {
-                    $allJobs->whereIn('user_id', collect($users)->pluck('id')->all());
+                if ($request->filled('count') && $request->count != false) {
+                    return [
+                        'count' => $jobs->count(),
+                    ];
                 }
             }
-            if (isset($requestdata['translator_email']) && count($requestdata['translator_email'])) {
-                $users = DB::table('users')->whereIn('email', $requestdata['translator_email'])->get();
-                if ($users) {
-                    $allJobIDs = DB::table('translator_job_rel')->whereNull('cancel_at')->whereIn('user_id', collect($users)->pluck('id')->all())->lists('job_id');
-                    $allJobs->whereIn('id', $allJobIDs);
+
+            $jobs = ($request->filled('id') && is_array($request->id)) ? $jobs->whereIn('id', $request->id) : $jobs->where('id', $request->id);
+            $request = (is_array($request->id)) ? $request : $request->only(['id']);
+        
+            $jobs = $this->commonFilter($jobs, $request);
+
+            if (!empty($request['translator_email']) && count($request['translator_email']) > 0) 
+            {
+                $userIds = User::whereIn('email', $request['translator_email'])->pluck('id');
+
+                if ($userIds) {
+                    $jobsIds = DB::table('translator_job_rel')->whereNull('cancel_at')->whereIn('user_id', $userIds)->lists('job_id');
+                    $jobs->whereIn('id', $jobsIds);
                 }
             }
-            if (isset($requestdata['filter_timetype']) && $requestdata['filter_timetype'] == "created") {
-                if (isset($requestdata['from']) && $requestdata['from'] != "") {
-                    $allJobs->where('created_at', '>=', $requestdata["from"]);
+
+            $jobs = (!empty($request['job_type'])) ? $jobs->whereIn('job_type', $request['job_type']) : $jobs;
+            $jobs = (!empty($request['physical'])) ? $jobs->where([['customer_physical_type', $request['physical']], ['ignore_physical', false]]) : $jobs;
+
+            if (!empty($request['phone'])) {
+                $jobs->where('customer_phone_type', $request['phone']);
+                if(isset($request['physical']))
+                {
+                    $jobs->where('ignore_physical_phone', false);
                 }
-                if (isset($requestdata['to']) && $requestdata['to'] != "") {
-                    $to = $requestdata["to"] . " 23:59:00";
-                    $allJobs->where('created_at', '<=', $to);
-                }
-                $allJobs->orderBy('created_at', 'desc');
-            }
-            if (isset($requestdata['filter_timetype']) && $requestdata['filter_timetype'] == "due") {
-                if (isset($requestdata['from']) && $requestdata['from'] != "") {
-                    $allJobs->where('due', '>=', $requestdata["from"]);
-                }
-                if (isset($requestdata['to']) && $requestdata['to'] != "") {
-                    $to = $requestdata["to"] . " 23:59:00";
-                    $allJobs->where('due', '<=', $to);
-                }
-                $allJobs->orderBy('due', 'desc');
+                
             }
 
-            if (isset($requestdata['job_type']) && $requestdata['job_type'] != '') {
-                $allJobs->whereIn('job_type', $requestdata['job_type']);
-                /*$allJobs->where('jobs.job_type', '=', $requestdata['job_type']);*/
+            $jobs = (!empty($request['flagged'])) ? $jobs->where([['flagged', $request['flagged']],['ignore_flagged', false]]) : $jobs;
+            $jobs = (!empty($request['distance'] && $request['distance'] == 'empty')) ?  $jobs->whereDoesntHave('distance') : $jobs;
+            $jobs = (!empty($request['salary']) &&  $request['salary'] == 'yes') ? $jobs->whereDoesntHave('user.salaries') : $jobs;
+
+            if (!empty($request['count']) && $request['count'] == 'true') {
+                return ['count' => $jobs->count()];
             }
 
-            if (isset($requestdata['physical'])) {
-                $allJobs->where('customer_physical_type', $requestdata['physical']);
-                $allJobs->where('ignore_physical', 0);
-            }
-
-            if (isset($requestdata['phone'])) {
-                $allJobs->where('customer_phone_type', $requestdata['phone']);
-                if(isset($requestdata['physical']))
-                $allJobs->where('ignore_physical_phone', 0);
-            }
-
-            if (isset($requestdata['flagged'])) {
-                $allJobs->where('flagged', $requestdata['flagged']);
-                $allJobs->where('ignore_flagged', 0);
-            }
-
-            if (isset($requestdata['distance']) && $requestdata['distance'] == 'empty') {
-                $allJobs->whereDoesntHave('distance');
-            }
-
-            if(isset($requestdata['salary']) &&  $requestdata['salary'] == 'yes') {
-                $allJobs->whereDoesntHave('user.salaries');
-            }
-
-            if (isset($requestdata['count']) && $requestdata['count'] == 'true') {
-                $allJobs = $allJobs->count();
-
-                return ['count' => $allJobs];
-            }
-
-            if (isset($requestdata['consumer_type']) && $requestdata['consumer_type'] != '') {
-                $allJobs->whereHas('user.userMeta', function($q) use ($requestdata) {
-                    $q->where('consumer_type', $requestdata['consumer_type']);
+            if (!empty($request['consumer_type'])) {
+                $jobs->whereHas('user.userMeta', function($query) use ($request) {
+                    $query->where('consumer_type', $request['consumer_type']);
                 });
             }
 
-            if (isset($requestdata['booking_type'])) {
-                if ($requestdata['booking_type'] == 'physical')
-                    $allJobs->where('customer_physical_type', 'yes');
-                if ($requestdata['booking_type'] == 'phone')
-                    $allJobs->where('customer_phone_type', 'yes');
+            if (!empty($request['booking_type'])) {
+                if ($request['booking_type'] == 'physical')
+                    $jobs->where('customer_physical_type', 'yes');
+                if ($request['booking_type'] == 'phone')
+                    $jobs->where('customer_phone_type', 'yes');
             }
-            
-            $allJobs->orderBy('created_at', 'desc');
-            $allJobs->with('user', 'language', 'feedback.user', 'translatorJobRel.user', 'distance');
-            if ($limit == 'all')
-                $allJobs = $allJobs->get();
-            else
-                $allJobs = $allJobs->paginate(15);
 
         } else {
 
-            $allJobs = Job::query();
-
-            if (isset($requestdata['id']) && $requestdata['id'] != '') {
-                $allJobs->where('id', $requestdata['id']);
-                $requestdata = array_only($requestdata, ['id']);
+            if ($request->filled('id')) {
+                $jobs->where('id', $request->id);
+                $request = $request->only(['id']);
             }
 
-            if ($consumer_type == 'RWS') {
-                $allJobs->where('job_type', '=', 'rws');
-            } else {
-                $allJobs->where('job_type', '=', 'unpaid');
-            }
-            if (isset($requestdata['feedback']) && $requestdata['feedback'] != 'false') {
-                $allJobs->where('ignore_feedback', '0');
-                $allJobs->whereHas('feedback', function($q) {
-                    $q->where('rating', '<=', '3');
+            $jobs = ($consumer_type == 'RWS') ? $jobs->where('job_type', '=', 'rws') : $jobs->where('job_type', '=', 'unpaid');
+            
+            if (isset($request['feedback']) && $request['feedback'] != 'false') {
+
+                $jobs->where('ignore_feedback', '0');
+                $jobs->whereHas('feedback', function($query) {
+                    return $query->where('rating', '<=', '3');
                 });
-                if(isset($requestdata['count']) && $requestdata['count'] != 'false') return ['count' => $allJobs->count()];
+
+                if(isset($request['count']) && $request['count'] != 'false')
+                {
+                    return ['count' => $jobs->count()];
+                }
             }
             
-            if (isset($requestdata['lang']) && $requestdata['lang'] != '') {
-                $allJobs->whereIn('from_language_id', $requestdata['lang']);
-            }
-            if (isset($requestdata['status']) && $requestdata['status'] != '') {
-                $allJobs->whereIn('status', $requestdata['status']);
-            }
-            if (isset($requestdata['job_type']) && $requestdata['job_type'] != '') {
-                $allJobs->whereIn('job_type', $requestdata['job_type']);
-            }
-            if (isset($requestdata['customer_email']) && $requestdata['customer_email'] != '') {
-                $user = DB::table('users')->where('email', $requestdata['customer_email'])->first();
-                if ($user) {
-                    $allJobs->where('user_id', '=', $user->id);
-                }
-            }
-            if (isset($requestdata['filter_timetype']) && $requestdata['filter_timetype'] == "created") {
-                if (isset($requestdata['from']) && $requestdata['from'] != "") {
-                    $allJobs->where('created_at', '>=', $requestdata["from"]);
-                }
-                if (isset($requestdata['to']) && $requestdata['to'] != "") {
-                    $to = $requestdata["to"] . " 23:59:00";
-                    $allJobs->where('created_at', '<=', $to);
-                }
-                $allJobs->orderBy('created_at', 'desc');
-            }
-            if (isset($requestdata['filter_timetype']) && $requestdata['filter_timetype'] == "due") {
-                if (isset($requestdata['from']) && $requestdata['from'] != "") {
-                    $allJobs->where('due', '>=', $requestdata["from"]);
-                }
-                if (isset($requestdata['to']) && $requestdata['to'] != "") {
-                    $to = $requestdata["to"] . " 23:59:00";
-                    $allJobs->where('due', '<=', $to);
-                }
-                $allJobs->orderBy('due', 'desc');
-            }
-
-            $allJobs->orderBy('created_at', 'desc');
-            $allJobs->with('user', 'language', 'feedback.user', 'translatorJobRel.user', 'distance');
-            if ($limit == 'all')
-                $allJobs = $allJobs->get();
-            else
-                $allJobs = $allJobs->paginate(15);
-
+            $jobs = $this->commonFilter($jobs, $request);
         }
-        return $allJobs;
+        
+        $jobs->orderBy('created_at', 'desc');
+        $jobs->with('user', 'language', 'feedback.user', 'translatorJobRel.user', 'distance');
+        if ($limit == 'all')
+        {  
+            return $jobs->get();
+        }
+               
+        return $jobs->paginate(15);
+    }
+
+    private function commonFilter($jobs, $request)
+    {
+        if (!empty($request['lang'])) {
+            $jobs->whereIn('from_language_id', $request['lang']);
+        }
+        if (!empty($request['status'])) {
+            $jobs->whereIn('status', $request['status']);
+        }
+        if (!empty($request['expired_at'])) {
+            $jobs->where('expired_at', '>=', $request['expired_at']);
+        }
+        if (!empty($request['will_expire_at'])) {
+            $jobs->where('will_expire_at', '>=', $request['will_expire_at']);
+        }
+        if (!empty($request['customer_email']) && count($request['customer_email']) > 0) 
+        {
+            $userIds = User::whereIn('email', $request['customer_email'])->pluck('id');
+            if ($userIds->count > 0) {
+                $jobs->whereIn('user_id', $userIds);
+            }
+        }
+
+        if (!empty($request['filter_timetype']))
+        {
+            $from = $request["from"] . " 00:00:00";
+            $to = $request['to'] . " 23:59:59";
+
+            if ($request['filter_timetype'] == "created")
+            {
+                if (!empty($request['from'])) 
+                {
+                    $jobs->where('created_at', '>=', $from);
+                }
+
+                if (!empty($request['to'])) 
+                {
+                    $jobs->where('created_at', '<=', $to);
+                }
+                
+                $jobs->orderBy('created_at', 'desc');
+            }
+
+            if ($request['filter_timetype'] == "due")
+            {
+                if (!empty($request['from'])) 
+                {
+                    $jobs->where('due', '>=', $from);
+                }
+
+                if (!empty($request['to'])) 
+                {
+                    $jobs->where('due', '<=', $to);
+                }
+
+                $jobs->orderBy('due', 'desc');
+            }
+        }
+
+        return $jobs;
     }
 
     public function alerts()
